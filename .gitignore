@@ -9,3 +9,17 @@ dist/
 *.png
 *.svg
 *.jpg
+!assets/*.png
+!docs/*.png
+!android/app/src/main/res/**/*.png
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/.kotlin/
+*.jks
+*.keystore
+*.apk

@@ -1,0 +1,81 @@
+name: Release
+
+# Al publicar una etiqueta vX.Y.Z se compilan el .exe, el .zip y el .apk
+# y se adjuntan a una release de GitHub con nombres fijos, para que los
+# enlaces «releases/latest/download/...» del README siempre funcionen.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt pyinstaller
+      - run: pytest -q
+      - run: python scripts/build_windows.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/GeneradorQR.exe
+            dist/GeneradorQR-windows.zip
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Preparar keystore de firma
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: Compilar APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/GeneradorQR-android.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: GeneradorQR-android.apk
+
+  release:
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Código fuente en .zip
+        run: git archive --format=zip --prefix=generador-de-qrs/ -o GeneradorQR-source.zip HEAD
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Generador de QRs ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            GeneradorQR.exe
+            GeneradorQR-windows.zip
+            GeneradorQR-android.apk
+            GeneradorQR-source.zip

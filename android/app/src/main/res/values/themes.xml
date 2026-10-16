@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.GeneradorQR" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E0F11</item>
+        <item name="android:statusBarColor">#16181B</item>
+        <item name="android:navigationBarColor">#16181B</item>
+    </style>
+</resources>
