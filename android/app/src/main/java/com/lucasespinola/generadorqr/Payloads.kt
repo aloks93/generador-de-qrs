@@ -27,7 +27,7 @@ object Payloads {
     /** Equivale a `urllib.parse.quote(value, safe)` de Python. */
     private fun quote(value: String, safe: String = ""): String {
         var out = URLEncoder.encode(value, "UTF-8").replace("+", "%20").replace("*", "%2A").replace("%7E", "~")
-        if ('/' in safe) out = out.replace("%2F", "/")
+        for (ch in safe) out = out.replace(URLEncoder.encode(ch.toString(), "UTF-8"), ch.toString())
         return out
     }
 
@@ -156,5 +156,53 @@ object Payloads {
         if (label.isNotBlank()) params += "label" to label.trim()
         val q = query(params)
         return "${currency.lowercase()}:$a" + if (q.isNotEmpty()) "?$q" else ""
+    }
+
+    val SOCIAL_NETWORKS = linkedMapOf(
+        "Instagram" to "https://instagram.com/%s",
+        "Facebook" to "https://facebook.com/%s",
+        "TikTok" to "https://tiktok.com/@%s",
+        "X / Twitter" to "https://x.com/%s",
+        "YouTube" to "https://youtube.com/@%s",
+        "LinkedIn" to "https://linkedin.com/in/%s",
+        "GitHub" to "https://github.com/%s",
+        "Twitch" to "https://twitch.tv/%s",
+    )
+
+    private fun handle(user: String, field: String): String =
+        quote(required(user, field).trimStart('@').trim('/'), safe = "._-")
+
+    fun social(network: String, user: String): String {
+        val template = SOCIAL_NETWORKS[network] ?: throw InvalidInput("Red social no soportada.")
+        return template.format(handle(user, "Usuario"))
+    }
+
+    fun telegram(user: String) = "https://t.me/${handle(user, "Usuario")}"
+
+    fun maps(query: String) =
+        "https://www.google.com/maps/search/?api=1&query=" + quote(required(query, "Dirección o lugar"))
+
+    fun paypal(user: String, amount: String, currency: String): String {
+        var link = "https://paypal.me/${handle(user, "Usuario de PayPal")}"
+        if (amount.isNotBlank()) {
+            val normalized = amount.trim().replace(",", ".")
+            normalized.toDoubleOrNull() ?: throw InvalidInput("La cantidad debe ser un número.")
+            link += "/$normalized${currency.uppercase()}"
+        }
+        return link
+    }
+
+    private fun meEscape(v: String): String {
+        var out = v
+        for (ch in listOf("\\", ";", ",", ":")) out = out.replace(ch, "\\" + ch)
+        return out
+    }
+
+    fun mecard(name: String, phone: String, email: String, note: String): String {
+        val parts = mutableListOf("N:${meEscape(required(name, "Nombre"))}")
+        if (phone.isNotBlank()) parts += "TEL:${digits(phone)}"
+        if (email.isNotBlank()) parts += "EMAIL:${meEscape(email.trim())}"
+        if (note.isNotBlank()) parts += "NOTE:${meEscape(note.trim())}"
+        return "MECARD:" + parts.joinToString(";") + ";;"
     }
 }

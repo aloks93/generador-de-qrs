@@ -48,7 +48,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -74,18 +73,25 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 private const val PREFS = "ajustes"
 private const val PREVIEW_PX = 720
+private const val DEBOUNCE_MS = 120L
 
 private val CODE_COLORS = listOf(0xFF000000, 0xFF1A1A1A, 0xFF1A3D8F, 0xFF0B5D3B, 0xFF7A0E1E, 0xFFE05A00, 0xFF4B2A7A, 0xFFFFFFFF)
     .map { it.toInt() }
 private val BACK_COLORS = listOf(0xFFFFFFFF, 0xFFF2F1ED, 0xFFFFF4E0, 0xFFE8F0FF, 0xFF0E0F11, 0xFF000000)
     .map { it.toInt() }
+private val ACCENT_COLORS = listOf(0xFFE05A00, 0xFF1A3D8F, 0xFF0B5D3B, 0xFF7A0E1E, 0xFF4B2A7A, 0xFF00A3A3, 0xFFD4A017, 0xFF000000)
+    .map { it.toInt() }
+private val MATRIX_SYMBOLOGIES = Symbology.values().filter { !it.linear }
 
 /** Resultado de generar: o datos válidos con su matriz, o un mensaje de error. */
 private sealed interface Output {
-    data class Ready(val data: String, val matrix: QrMatrix, val preview: Bitmap) : Output
+    data class Ready(val data: String, val symbol: Symbol, val preview: Bitmap) : Output
     data class Invalid(val message: String) : Output
 }
 
@@ -95,21 +101,26 @@ class MainActivity : ComponentActivity() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         setContent {
             var dark by remember { mutableStateOf(prefs.getBoolean("oscuro", true)) }
+            var advanced by remember { mutableStateOf(prefs.getBoolean("avanzado", false)) }
             LaunchedEffect(dark) {
                 val style = if (dark) SystemBarStyle.dark(AColor.TRANSPARENT)
                 else SystemBarStyle.light(AColor.TRANSPARENT, AColor.TRANSPARENT)
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
                 prefs.edit().putBoolean("oscuro", dark).apply()
             }
+            LaunchedEffect(advanced) { prefs.edit().putBoolean("avanzado", advanced).apply() }
             CompositionLocalProvider(LocalPalette provides if (dark) DarkPalette else LightPalette) {
-                GeneratorScreen(dark = dark, onToggleTheme = { dark = !dark })
+                GeneratorScreen(
+                    dark = dark, onToggleTheme = { dark = !dark },
+                    advanced = advanced, onSetAdvanced = { advanced = it },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
+private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit, advanced: Boolean, onSetAdvanced: (Boolean) -> Unit) {
     val p = LocalPalette.current
     val context = LocalContext.current
 
@@ -117,24 +128,31 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
     val values = remember { mutableStateMapOf<String, String>() }
     var fill by remember { mutableIntStateOf(CODE_COLORS[0]) }
     var back by remember { mutableIntStateOf(BACK_COLORS[0]) }
-    var level by remember { mutableStateOf(ErrorCorrectionLevel.M) }
-    var box by remember { mutableIntStateOf(16) }
     var logo by remember { mutableStateOf<Bitmap?>(null) }
+    // Ajustes avanzados: se conservan aunque se vuelva al modo normal.
+    var adv by remember { mutableStateOf(QrStyle()) }
+    var matrixSymbology by remember { mutableStateOf(Symbology.QR) }
+    var box by remember { mutableIntStateOf(16) }
 
-    val type = QR_TYPES[typeIndex]
-    val effectiveLevel = if (logo != null) ErrorCorrectionLevel.H else level
-    val style = QrStyle(fill = fill, back = back, level = effectiveLevel, logo = logo)
+    val type = ALL_TYPES[typeIndex]
+    val symbology = type.symbology ?: if (advanced) matrixSymbology else Symbology.QR
+    val style = if (advanced) adv.copy(fill = fill, back = back, logo = logo) else QrStyle(fill = fill, back = back, logo = logo)
+    val exportBox = if (advanced) box else 16
 
-    // Solo se recalcula cuando cambian los datos o el estilo (no con cada recomposición).
-    val output by remember(typeIndex, style) {
-        derivedStateOf {
-            val fields = type.fields.associate { it.key to (values["${type.code}.${it.key}"] ?: "") }
-                .filterValues { it.isNotEmpty() }
+    val fields = type.fields.filter { advanced || !it.advanced }
+        .associate { it.key to (values["${type.code}.${it.key}"] ?: "") }
+        .filterValues { it.isNotEmpty() }
+
+    // El código se genera fuera del hilo principal y tras una pausa al teclear: si se
+    // hiciera en cada pulsación, al escribir rápido el campo de texto perdería letras.
+    var output by remember { mutableStateOf<Output>(Output.Invalid("")) }
+    LaunchedEffect(typeIndex, fields, style, symbology) {
+        delay(DEBOUNCE_MS)
+        output = withContext(Dispatchers.Default) {
             try {
                 val data = type.build(fields)
-                val matrix = QrEngine.encode(data, effectiveLevel)
-                val n = matrix.size + style.border * 2
-                Output.Ready(data, matrix, QrEngine.render(matrix, style, maxOf(1, PREVIEW_PX / n)))
+                val symbol = QrEngine.encode(data, symbology, style)
+                Output.Ready(data, symbol, QrEngine.render(symbol, style, QrEngine.boxFor(symbol, style, PREVIEW_PX)))
             } catch (e: IllegalArgumentException) {
                 Output.Invalid(e.message ?: "Datos no válidos.")
             }
@@ -144,12 +162,12 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
 
     val savePng = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/png")) { uri ->
         if (uri != null && ready != null) {
-            writeTo(context, uri) { QrEngine.render(ready.matrix, style, box).compress(Bitmap.CompressFormat.PNG, 100, it) }
+            writeTo(context, uri) { QrEngine.render(ready.symbol, style, exportBox).compress(Bitmap.CompressFormat.PNG, 100, it) }
         }
     }
     val saveSvg = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/svg+xml")) { uri ->
         if (uri != null && ready != null) {
-            writeTo(context, uri) { it.write(QrEngine.svg(ready.matrix, style, box).toByteArray()) }
+            writeTo(context, uri) { it.write(QrEngine.svg(ready.symbol, style, exportBox).toByteArray()) }
         }
     }
     val pickLogo = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -171,13 +189,19 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
             Box(Modifier.width(5.dp).fillMaxHeight().background(p.accent))
             Text(
                 "QR//GEN", color = p.text, fontSize = 20.sp, fontWeight = FontWeight.Black,
-                modifier = Modifier.padding(start = 16.dp),
+                modifier = Modifier.padding(start = 14.dp).weight(1f),
             )
-            Text("v1.0", style = Type.label, color = p.muted, modifier = Modifier.padding(start = 10.dp).weight(1f))
             Segmented(
-                listOf("CLARO", "OSCURO"), if (dark) 1 else 0, { if ((it == 1) != dark) onToggleTheme() },
-                Modifier.padding(end = 12.dp).width(150.dp).height(30.dp),
+                listOf("NORMAL", "AVANZ."), if (advanced) 1 else 0, { onSetAdvanced(it == 1) },
+                Modifier.width(150.dp).height(30.dp),
             )
+            Box(
+                Modifier.padding(horizontal = 10.dp).size(30.dp).border(1.dp, p.border).background(p.surface2)
+                    .clickable(onClick = onToggleTheme),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(if (dark) "☾" else "☀", color = p.text, fontSize = 15.sp)
+            }
         }
         Divider()
 
@@ -186,8 +210,12 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
             Modifier.fillMaxWidth().background(p.surface).horizontalScroll(rememberScrollState())
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            QR_TYPES.forEachIndexed { i, t ->
+            ALL_TYPES.forEachIndexed { i, t ->
+                if (i == QR_TYPES.size) {
+                    Text("BARRAS", style = Type.label, color = p.muted, modifier = Modifier.padding(horizontal = 6.dp))
+                }
                 val active = i == typeIndex
                 Box(
                     Modifier
@@ -206,20 +234,23 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
         Divider()
 
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(16.dp)) {
-            Text("%02d / %s".format(typeIndex + 1, type.code), style = Type.label, color = p.accent)
+            val group = if (type.linear) "BARRAS" else "QR"
+            Text("%02d / %s / %s".format(typeIndex + 1, group, type.code), style = Type.label, color = p.accent)
             Text(type.name, style = Type.title, color = p.text, modifier = Modifier.padding(bottom = 8.dp))
 
             // ---------- Vista previa ----------
+            val ratio = ready?.let { it.preview.width.toFloat() / it.preview.height } ?: 1f
             Box(
-                Modifier.fillMaxWidth().aspectRatio(1f).background(p.surface)
-                    .border(1.dp, p.borderStrong).padding(2.dp),
+                Modifier.fillMaxWidth(if (ratio > 1.2f) 1f else 0.7f).align(Alignment.CenterHorizontally)
+                    .aspectRatio(ratio.coerceAtLeast(0.5f))
+                    .background(p.surface).border(1.dp, p.borderStrong).padding(2.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 when (val o = output) {
                     is Output.Ready -> Image(
-                        o.preview.asImageBitmap(), contentDescription = "Código QR",
+                        o.preview.asImageBitmap(), contentDescription = "Código generado",
                         modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit,
-                        filterQuality = FilterQuality.None,
+                        filterQuality = if (style.styled) FilterQuality.Medium else FilterQuality.None,
                     )
                     is Output.Invalid -> Text(
                         "SIN DATOS\ncompleta los campos", style = Type.label, color = p.muted,
@@ -228,28 +259,35 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
                 }
             }
             val readout = when (val o = output) {
-                is Output.Ready -> "V%02d · %d×%d MÓD · CORR %s · %d B".format(
-                    o.matrix.version, o.matrix.size, o.matrix.size, effectiveLevel.name, o.data.toByteArray().size,
-                )
+                is Output.Ready -> {
+                    val s = o.symbol
+                    when {
+                        s.linear -> "${symbology.label.uppercase()} · ${s.width} MÓD · ${s.text}"
+                        s.version != null -> "V%02d · %d×%d MÓD · CORR %s · %d B".format(
+                            s.version, s.width, s.height, if (logo != null) "H" else style.level.name, o.data.toByteArray().size,
+                        )
+                        else -> "${symbology.label.uppercase()} · ${s.width}×${s.height} MÓD · ${o.data.toByteArray().size} B"
+                    }
+                }
                 is Output.Invalid -> o.message
             }
             Text(
                 readout, style = Type.label.copy(fontWeight = FontWeight.Normal),
-                color = if (ready == null && values.keys.any { it.startsWith("${type.code}.") }) p.error else p.muted,
+                color = if (ready == null && fields.isNotEmpty()) p.error else p.muted,
                 modifier = Modifier.padding(top = 6.dp, bottom = 10.dp),
             )
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IndButton("GUARDAR PNG", primary = true, enabled = ready != null, modifier = Modifier.weight(1f)) {
-                    savePng.launch("qr-${type.code.lowercase()}.png")
+                    savePng.launch("codigo-${type.code.lowercase()}.png")
                 }
                 IndButton("COMPARTIR", enabled = ready != null, modifier = Modifier.weight(1f)) {
-                    ready?.let { share(context, QrEngine.render(it.matrix, style, box)) }
+                    ready?.let { share(context, QrEngine.render(it.symbol, style, exportBox)) }
                 }
             }
             Row(Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 IndButton("SVG", enabled = ready != null, modifier = Modifier.weight(1f)) {
-                    saveSvg.launch("qr-${type.code.lowercase()}.svg")
+                    saveSvg.launch("codigo-${type.code.lowercase()}.svg")
                 }
                 IndButton("COPIAR TEXTO", enabled = ready != null, modifier = Modifier.weight(1f)) {
                     ready?.let { copyText(context, it.data) }
@@ -267,18 +305,14 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
                 }
             }
             SectionTitle("DATOS")
-            type.fields.forEach { f ->
+            type.fields.filter { advanced || !it.advanced }.forEach { f ->
                 val key = "${type.code}.${f.key}"
                 when (f.kind) {
                     Kind.CHECK -> CheckRow(f.label, values[key] == "true") { values[key] = it.toString() }
                     Kind.CHOICE -> {
                         FieldLabel(f.label)
                         val selected = f.options.indexOf(values[key] ?: f.options[0]).coerceAtLeast(0)
-                        if (f.options.size <= 3) {
-                            Segmented(f.options, selected, { values[key] = f.options[it] }, Modifier.fillMaxWidth().height(40.dp))
-                        } else {
-                            ChoiceGrid(f.options, selected) { values[key] = f.options[it] }
-                        }
+                        ChoiceGrid(f.options, selected) { values[key] = f.options[it] }
                     }
                     else -> {
                         FieldLabel(f.label)
@@ -294,39 +328,111 @@ private fun GeneratorScreen(dark: Boolean, onToggleTheme: () -> Unit) {
                 }
             }
 
-            // ---------- Ajustes ----------
-            SectionTitle("AJUSTES")
+            // ---------- Ajustes básicos ----------
+            SectionTitle(if (advanced) "AJUSTES AVANZADOS" else "AJUSTES")
             FieldLabel("Color del código")
-            Swatches(CODE_COLORS, fill) { fill = it }
+            Swatches(CODE_COLORS, fill) { fill = it ?: fill }
             FieldLabel("Color de fondo")
-            Swatches(BACK_COLORS, back) { back = it }
-
-            FieldLabel(if (logo != null) "Corrección (H forzada por el logo)" else "Corrección de errores")
-            val levels = listOf(ErrorCorrectionLevel.L, ErrorCorrectionLevel.M, ErrorCorrectionLevel.Q, ErrorCorrectionLevel.H)
-            Segmented(
-                levels.map { it.name }, levels.indexOf(effectiveLevel),
-                { if (logo == null) level = levels[it] }, Modifier.fillMaxWidth().height(40.dp),
-            )
-
-            FieldLabel("Tamaño al exportar · $box px/módulo")
-            Slider(
-                value = box.toFloat(), onValueChange = { box = it.toInt() }, valueRange = 4f..30f, steps = 25,
-                colors = SliderDefaults.colors(
-                    thumbColor = p.accent, activeTrackColor = p.accent, inactiveTrackColor = p.surface2,
-                    activeTickColor = Color.Transparent, inactiveTickColor = Color.Transparent,
-                ),
-            )
-
-            FieldLabel("Logo central")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                IndButton(if (logo == null) "ELEGIR IMAGEN" else "CAMBIAR LOGO", modifier = Modifier.weight(1f)) {
-                    pickLogo.launch("image/*")
+            Swatches(BACK_COLORS, back) { back = it ?: back }
+            if (!type.linear) {
+                FieldLabel("Logo central")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    IndButton(if (logo == null) "ELEGIR IMAGEN" else "CAMBIAR LOGO", modifier = Modifier.weight(1f)) {
+                        pickLogo.launch("image/*")
+                    }
+                    if (logo != null) IndButton("QUITAR", modifier = Modifier.width(110.dp)) { logo = null }
                 }
-                if (logo != null) IndButton("QUITAR", modifier = Modifier.width(110.dp)) { logo = null }
+            }
+            if (!advanced) {
+                Text(
+                    "Activa el modo AVANZ. para elegir formato (Data Matrix, Aztec, PDF417), forma de módulos y ojos, " +
+                        "degradados, transparencia, texto, bordes y más.",
+                    style = Type.body.copy(fontSize = 13.sp), color = p.muted, modifier = Modifier.padding(top = 16.dp),
+                )
+            }
+
+            // ---------- Ajustes avanzados ----------
+            if (advanced) {
+                val is2d = !symbology.linear
+                if (type.symbology == null) {
+                    FieldLabel("Formato 2D")
+                    ChoiceGrid(MATRIX_SYMBOLOGIES.map { it.label }, MATRIX_SYMBOLOGIES.indexOf(matrixSymbology)) {
+                        matrixSymbology = MATRIX_SYMBOLOGIES[it]
+                    }
+                }
+                if (symbology == Symbology.QR) {
+                    FieldLabel(if (logo != null) "Corrección (H forzada por el logo)" else "Corrección de errores")
+                    val levels = listOf(ErrorCorrectionLevel.L, ErrorCorrectionLevel.M, ErrorCorrectionLevel.Q, ErrorCorrectionLevel.H)
+                    Segmented(
+                        levels.map { it.name }, levels.indexOf(if (logo != null) ErrorCorrectionLevel.H else adv.level),
+                        { if (logo == null) adv = adv.copy(level = levels[it]) }, Modifier.fillMaxWidth().height(40.dp),
+                    )
+                    Stepper("Versión mínima", adv.version, 1, 40) { adv = adv.copy(version = it) }
+                    Stepper("Máscara", adv.mask, 0, 7) { adv = adv.copy(mask = it) }
+                }
+                if (is2d) {
+                    FieldLabel("Forma de los módulos")
+                    ChoiceGrid(ModuleShape.values().map { it.label }, adv.moduleShape.ordinal) {
+                        adv = adv.copy(moduleShape = ModuleShape.values()[it])
+                    }
+                    SliderRow("Escala del módulo", "${(adv.moduleScale * 100).toInt()}%", adv.moduleScale * 100, 50f..100f, 9) {
+                        adv = adv.copy(moduleScale = it / 100f)
+                    }
+                }
+                if (symbology == Symbology.QR) {
+                    FieldLabel("Forma de los ojos")
+                    ChoiceGrid(EyeShape.values().map { it.label }, adv.eyeShape.ordinal) {
+                        adv = adv.copy(eyeShape = EyeShape.values()[it])
+                    }
+                    FieldLabel("Color del ojo exterior")
+                    Swatches(ACCENT_COLORS, adv.eyeColor, allowSame = true) { adv = adv.copy(eyeColor = it) }
+                    FieldLabel("Color del ojo interior")
+                    Swatches(ACCENT_COLORS, adv.eyeInnerColor, allowSame = true) { adv = adv.copy(eyeInnerColor = it) }
+                }
+                FieldLabel("Degradado")
+                ChoiceGrid(Gradient.values().map { it.label }, adv.gradient.ordinal) {
+                    adv = adv.copy(gradient = Gradient.values()[it])
+                }
+                if (adv.gradient != Gradient.NONE) {
+                    FieldLabel("Segundo color")
+                    Swatches(ACCENT_COLORS, adv.gradientColor) { adv = adv.copy(gradientColor = it ?: adv.gradientColor) }
+                }
+                CheckRow("Fondo transparente (PNG/SVG)", adv.transparent) { adv = adv.copy(transparent = it) }
+                SliderRow("Borde (zona de silencio)", "${adv.border}", adv.border.toFloat(), 0f..10f, 9) {
+                    adv = adv.copy(border = it.toInt())
+                }
+                SliderRow("Tamaño al exportar", "$box px/mód", box.toFloat(), 2f..30f, 27) { box = it.toInt() }
+                if (is2d && logo != null) {
+                    SliderRow("Tamaño del logo", "${(adv.logoRatio * 100).toInt()}%", adv.logoRatio * 100, 10f..35f, 24) {
+                        adv = adv.copy(logoRatio = it / 100f)
+                    }
+                    CheckRow("Recuadro detrás del logo", adv.logoPad) { adv = adv.copy(logoPad = it) }
+                }
+                if (symbology.linear) {
+                    SliderRow("Altura de las barras", "${adv.barHeight}", adv.barHeight.toFloat(), 10f..120f, 21) {
+                        adv = adv.copy(barHeight = it.toInt())
+                    }
+                    CheckRow("Mostrar los dígitos", adv.showText) { adv = adv.copy(showText = it) }
+                }
+                if (!symbology.linear || !adv.showText) {
+                    FieldLabel("Texto debajo del código")
+                    Input(adv.caption, { adv = adv.copy(caption = it) }, "p. ej. ESCANÉAME", multiline = false, password = false, numeric = false)
+                }
+                SliderRow(
+                    "Tamaño del texto", if (adv.captionSize == 0) "AUTO" else "${adv.captionSize}",
+                    adv.captionSize.toFloat(), 0f..60f, 59,
+                ) { adv = adv.copy(captionSize = it.toInt()) }
+                FieldLabel("Color del texto")
+                Swatches(ACCENT_COLORS, adv.captionColor, allowSame = true) { adv = adv.copy(captionColor = it) }
+                Box(Modifier.padding(top = 18.dp)) {
+                    IndButton("RESTABLECER AJUSTES", modifier = Modifier.fillMaxWidth()) {
+                        adv = QrStyle(); matrixSymbology = Symbology.QR; box = 16
+                    }
+                }
             }
 
             Text(
-                "© Lucas Espinola · MIT", style = Type.label.copy(fontWeight = FontWeight.Normal), color = p.muted,
+                "© Lucas Espinola · MIT · v1.1", style = Type.label.copy(fontWeight = FontWeight.Normal), color = p.muted,
                 modifier = Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 12.dp), textAlign = TextAlign.Center,
             )
         }
@@ -386,7 +492,7 @@ private fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> U
     val p = LocalPalette.current
     Row(modifier.border(1.dp, p.border).background(p.border).padding(1.dp)) {
         options.forEachIndexed { i, label ->
-            SegmentCell(label, i == selected, { onSelect(i) })
+            SegmentCell(label, i == selected) { onSelect(i) }
             if (i < options.lastIndex) Spacer(Modifier.width(1.dp))
         }
     }
@@ -399,7 +505,7 @@ private fun RowScope.SegmentCell(label: String, active: Boolean, onClick: () -> 
         Modifier.weight(1f).fillMaxHeight().background(if (active) p.accent else p.surface2).clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, style = Type.button.copy(fontSize = 12.sp), color = if (active) p.onAccent else p.text)
+        Text(label, style = Type.button.copy(fontSize = 12.sp), color = if (active) p.onAccent else p.text, textAlign = TextAlign.Center)
     }
 }
 
@@ -410,6 +516,48 @@ private fun ChoiceGrid(options: List<String>, selected: Int, onSelect: (Int) -> 
             Segmented(chunk, selected - row * 3, { onSelect(row * 3 + it) }, Modifier.fillMaxWidth().height(40.dp))
         }
     }
+}
+
+@Composable
+private fun Stepper(label: String, value: Int?, min: Int, max: Int, onChange: (Int?) -> Unit) {
+    val p = LocalPalette.current
+    FieldLabel(label)
+    Row(Modifier.fillMaxWidth().height(40.dp).border(1.dp, p.border), verticalAlignment = Alignment.CenterVertically) {
+        StepButton("−") { onChange(value?.let { if (it <= min) null else it - 1 }) }
+        Text(
+            value?.toString() ?: "AUTO", style = Type.button, color = p.text, textAlign = TextAlign.Center,
+            modifier = Modifier.weight(1f),
+        )
+        StepButton("+") { onChange(((value ?: (min - 1)) + 1).coerceAtMost(max)) }
+    }
+}
+
+@Composable
+private fun StepButton(text: String, onClick: () -> Unit) {
+    val p = LocalPalette.current
+    Box(
+        Modifier.width(56.dp).fillMaxHeight().background(p.surface2).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) { Text(text, color = p.text, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
+}
+
+@Composable
+private fun SliderRow(
+    label: String, valueText: String, value: Float, range: ClosedFloatingPointRange<Float>, steps: Int,
+    onChange: (Float) -> Unit,
+) {
+    val p = LocalPalette.current
+    Row(Modifier.fillMaxWidth().padding(top = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label.uppercase(), style = Type.label.copy(fontWeight = FontWeight.Normal), color = p.muted, modifier = Modifier.weight(1f))
+        Text(valueText, style = Type.label, color = p.text)
+    }
+    Slider(
+        value = value, onValueChange = onChange, valueRange = range, steps = steps,
+        colors = SliderDefaults.colors(
+            thumbColor = p.accent, activeTrackColor = p.accent, inactiveTrackColor = p.surface2,
+            activeTickColor = Color.Transparent, inactiveTickColor = Color.Transparent,
+        ),
+    )
 }
 
 @Composable
@@ -468,10 +616,19 @@ private fun Input(
     )
 }
 
+/** Muestras de color; con [allowSame] la primera significa «igual que el código» (null). */
 @Composable
-private fun Swatches(colors: List<Int>, selected: Int, onSelect: (Int) -> Unit) {
+private fun Swatches(colors: List<Int>, selected: Int?, allowSame: Boolean = false, onSelect: (Int?) -> Unit) {
     val p = LocalPalette.current
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (allowSame) {
+            val active = selected == null
+            Box(
+                Modifier.size(36.dp).border(if (active) 2.dp else 1.dp, if (active) p.accent else p.border)
+                    .background(p.surface2).clickable { onSelect(null) },
+                contentAlignment = Alignment.Center,
+            ) { Text("=", color = p.text, fontWeight = FontWeight.Bold) }
+        }
         colors.forEach { c ->
             val active = c == selected
             Box(
@@ -493,21 +650,21 @@ private fun writeTo(context: Context, uri: Uri, block: (java.io.OutputStream) ->
 
 private fun share(context: Context, bitmap: Bitmap) {
     val dir = File(context.cacheDir, "shared").apply { mkdirs() }
-    val file = File(dir, "codigo-qr.png")
+    val file = File(dir, "codigo.png")
     file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "image/png"
         putExtra(Intent.EXTRA_STREAM, uri)
-        clipData = ClipData.newRawUri("QR", uri)
+        clipData = ClipData.newRawUri("Código", uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    context.startActivity(Intent.createChooser(intent, "Compartir QR"))
+    context.startActivity(Intent.createChooser(intent, "Compartir código"))
 }
 
 private fun copyText(context: Context, text: String) {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-    cm.setPrimaryClip(ClipData.newPlainText("QR", text))
+    cm.setPrimaryClip(ClipData.newPlainText("Código", text))
     toast(context, "Contenido copiado.")
 }
 

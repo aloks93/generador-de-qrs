@@ -16,6 +16,10 @@ def copy_image(img: Image.Image) -> None:
     from ctypes import wintypes
 
     buffer = io.BytesIO()
+    if img.mode == "RGBA":  # el portapapeles no admite transparencia: se aplana sobre blanco
+        flat = Image.new("RGB", img.size, "white")
+        flat.paste(img, (0, 0), img)
+        img = flat
     img.convert("RGB").save(buffer, "BMP")
     data = buffer.getvalue()[14:]  # CF_DIB no lleva la cabecera de archivo BMP
 

@@ -1,6 +1,5 @@
 package com.lucasespinola.generadorqr
 
-import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,9 +73,57 @@ class PayloadsTest {
         assertEquals("ethereum:0xabc", Payloads.crypto("0xabc", "", "ethereum", ""))
     }
 
+    @Test fun newContentTypes() {
+        assertEquals("https://instagram.com/lucas.e", Payloads.social("Instagram", "@lucas.e"))
+        assertEquals("https://tiktok.com/@lucas", Payloads.social("TikTok", "lucas"))
+        assertEquals("https://t.me/canal_x", Payloads.telegram("@canal_x"))
+        assertEquals(
+            "https://www.google.com/maps/search/?api=1&query=Plaza%20Mayor%2C%20Madrid",
+            Payloads.maps("Plaza Mayor, Madrid"),
+        )
+        assertEquals("https://paypal.me/lucas/12.5USD", Payloads.paypal("lucas", "12,5", "usd"))
+        assertEquals("https://paypal.me/lucas", Payloads.paypal("lucas", "", "EUR"))
+        assertEquals(
+            "MECARD:N:Ana\\; López;TEL:+34600;EMAIL:a@b.com;;",
+            Payloads.mecard("Ana; López", "+34 600", "a@b.com", ""),
+        )
+        fails { Payloads.social("MySpace", "x") }
+    }
+
     @Test fun encodeAndOverflow() {
-        val m = QrEngine.encode("https://ejemplo.com", ErrorCorrectionLevel.M)
-        assertEquals(17 + 4 * m.version, m.size)
-        fails { QrEngine.encode("x".repeat(5000), ErrorCorrectionLevel.M) }
+        val m = QrEngine.encode("https://ejemplo.com", Symbology.QR, QrStyle())
+        assertEquals(17 + 4 * m.version!!, m.width)
+        assertEquals(37, QrEngine.encode("hola", Symbology.QR, QrStyle(version = 5, mask = 3)).width)
+        fails { QrEngine.encode("x".repeat(5000), Symbology.QR, QrStyle()) }
+        fails { QrEngine.encode("abc", Symbology.EAN13, QrStyle()) }
+    }
+
+    /** Cada simbología se decodifica con el lector de ZXing a partir de la matriz generada. */
+    @Test fun everySymbologyDecodes() {
+        for (sym in Symbology.values()) {
+            val data = sym.example.ifEmpty { "https://ejemplo.com/123" }
+            val code = QrEngine.encode(data, sym, QrStyle())
+            val scale = 4
+            val quiet = 10
+            val rows = if (code.linear) 40 else code.height
+            val w = (code.width + 2 * quiet) * scale
+            val h = (rows + 2 * quiet) * scale
+            val pixels = IntArray(w * h) { i ->
+                val x = (i % w) / scale - quiet
+                val y = (i / w) / scale - quiet
+                val inside = x in 0 until code.width && y in 0 until rows
+                val on = inside && code[x, if (code.linear) 0 else y]
+                if (on) 0xFF000000.toInt() else 0xFFFFFFFF.toInt()
+            }
+            val source = com.google.zxing.RGBLuminanceSource(w, h, pixels)
+            val bitmap = com.google.zxing.BinaryBitmap(com.google.zxing.common.HybridBinarizer(source))
+            val hints = mapOf(
+                com.google.zxing.DecodeHintType.POSSIBLE_FORMATS to listOf(sym.format),
+                com.google.zxing.DecodeHintType.TRY_HARDER to true,
+            )
+            val result = com.google.zxing.MultiFormatReader().decode(bitmap, hints)
+            if (sym == Symbology.UPCE) continue // se lee expandido; basta con que decodifique
+            assertTrue("${sym.name}: ${result.text} vs ${code.text}", result.text == code.text || code.text.contains(result.text))
+        }
     }
 }

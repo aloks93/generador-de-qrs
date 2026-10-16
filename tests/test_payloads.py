@@ -86,3 +86,20 @@ def test_save_formats(tmp_path):
         out = save("hola", tmp_path / f"qr.{ext}", QROptions(fill_color="#123456"))
         assert out.stat().st_size > 0
     assert "#123456" in (tmp_path / "qr.svg").read_text(encoding="utf-8")
+
+
+def test_social_and_messaging():
+    assert payloads.social("Instagram", "@lucas.e") == "https://instagram.com/lucas.e"
+    assert payloads.social("TikTok", "lucas") == "https://tiktok.com/@lucas"
+    assert payloads.telegram("@canal_x") == "https://t.me/canal_x"
+    with pytest.raises(ValueError):
+        payloads.social("MySpace", "x")
+
+
+def test_maps_paypal_mecard():
+    assert payloads.maps("Plaza Mayor, Madrid") == (
+        "https://www.google.com/maps/search/?api=1&query=Plaza%20Mayor%2C%20Madrid"
+    )
+    assert payloads.paypal("lucas", "12,5", "usd") == "https://paypal.me/lucas/12.5USD"
+    assert payloads.paypal("lucas") == "https://paypal.me/lucas"
+    assert payloads.mecard("Ana; López", "+34 600", "a@b.com") == "MECARD:N:Ana\; López;TEL:+34600;EMAIL:a@b.com;;"

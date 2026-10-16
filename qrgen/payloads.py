@@ -181,3 +181,64 @@ def crypto(address: str, amount: str = "", currency: str = "bitcoin", label: str
         params["label"] = label.strip()
     query = urlencode(params, quote_via=quote)
     return f"{currency.lower()}:{address}" + (f"?{query}" if query else "")
+
+
+SOCIAL_NETWORKS = {
+    "Instagram": "https://instagram.com/{}",
+    "Facebook": "https://facebook.com/{}",
+    "TikTok": "https://tiktok.com/@{}",
+    "X / Twitter": "https://x.com/{}",
+    "YouTube": "https://youtube.com/@{}",
+    "LinkedIn": "https://linkedin.com/in/{}",
+    "GitHub": "https://github.com/{}",
+    "Twitch": "https://twitch.tv/{}",
+}
+
+
+def _handle(user: str, field: str) -> str:
+    return quote(_required(user, field).lstrip("@").strip("/"), safe="._-")
+
+
+def social(network: str, user: str) -> str:
+    template = SOCIAL_NETWORKS.get(network)
+    if template is None:
+        raise ValueError("Red social no soportada.")
+    return template.format(_handle(user, "Usuario"))
+
+
+def telegram(user: str) -> str:
+    return f"https://t.me/{_handle(user, 'Usuario')}"
+
+
+def maps(query: str) -> str:
+    return "https://www.google.com/maps/search/?api=1&query=" + quote(_required(query, "Dirección o lugar"))
+
+
+def paypal(user: str, amount: str = "", currency: str = "EUR") -> str:
+    link = f"https://paypal.me/{_handle(user, 'Usuario de PayPal')}"
+    if amount.strip():
+        try:
+            float(amount.replace(",", "."))
+        except ValueError:
+            raise ValueError("La cantidad debe ser un número.") from None
+        link += f"/{amount.strip().replace(',', '.')}{currency.upper()}"
+    return link
+
+
+def _mecard_escape(value: str) -> str:
+    for ch in ("\\", ";", ",", ":"):
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
+def mecard(name: str, phone: str = "", email: str = "", note: str = "") -> str:
+    """Contacto en formato MeCard: más corto que vCard (QR más pequeño)."""
+    e = _mecard_escape
+    parts = [f"N:{e(_required(name, 'Nombre'))}"]
+    if phone.strip():
+        parts.append(f"TEL:{_digits(phone)}")
+    if email.strip():
+        parts.append(f"EMAIL:{e(email.strip())}")
+    if note.strip():
+        parts.append(f"NOTE:{e(note.strip())}")
+    return "MECARD:" + ";".join(parts) + ";;"
